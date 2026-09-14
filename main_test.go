@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	openai "github.com/openai/openai-go/v3"
 )
 
 func TestExecuteCalculator(t *testing.T) {
@@ -51,7 +55,7 @@ func TestExecuteCalculator(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := executeCalculator(tt.rawArgs)
+			got, err := executeCalculator(context.Background(), tt.rawArgs)
 
 			if tt.wantError != "" {
 				if err == nil {
@@ -109,7 +113,7 @@ func TestDispatchTool(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := dispatchTool(tt.toolName, tt.rawArgs)
+			got, err := dispatchTool(context.Background(), tt.toolName, tt.rawArgs)
 
 			if tt.wantError != "" {
 				if err == nil {
@@ -221,7 +225,7 @@ func TestGetProjectStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := getProjectStatus(tt.rawArgs)
+			got, err := getProjectStatus(context.Background(), tt.rawArgs)
 			if tt.wantError != "" {
 				if err == nil {
 					t.Fatalf("expected error containing %q, got nil; result=%q", tt.wantError, got)
@@ -247,7 +251,8 @@ func TestGetProjectStatusCRUD(t *testing.T) {
 	delete(projectDataBase, title)
 	t.Cleanup(func() { delete(projectDataBase, title) })
 
-	addResult, err := getProjectStatus(`{"title":"crud-project","operation":"add","data":{"status":"pending","assignee":"D"}}`)
+	ctx := context.Background()
+	addResult, err := getProjectStatus(ctx, `{"title":"crud-project","operation":"add","data":{"status":"pending","assignee":"D"}}`)
 	if err != nil {
 		t.Fatalf("add returned error: %v", err)
 	}
@@ -255,7 +260,7 @@ func TestGetProjectStatusCRUD(t *testing.T) {
 		t.Fatalf("add result=%q, want pending status", addResult)
 	}
 
-	updateResult, err := getProjectStatus(`{"title":"crud-project","operation":"update","data":{"status":"processing","description":"updated"}}`)
+	updateResult, err := getProjectStatus(ctx, `{"title":"crud-project","operation":"update","data":{"status":"processing","description":"updated"}}`)
 	if err != nil {
 		t.Fatalf("update returned error: %v", err)
 	}
@@ -263,7 +268,7 @@ func TestGetProjectStatusCRUD(t *testing.T) {
 		t.Fatalf("update result=%q, want updated fields", updateResult)
 	}
 
-	queryResult, err := getProjectStatus(`{"projectId":3,"operation":"query","data":{}}`)
+	queryResult, err := getProjectStatus(ctx, `{"projectId":3,"operation":"query","data":{}}`)
 	if err != nil {
 		t.Fatalf("query by project ID returned error: %v", err)
 	}
@@ -271,7 +276,7 @@ func TestGetProjectStatusCRUD(t *testing.T) {
 		t.Fatalf("query result=%q, want crud-project", queryResult)
 	}
 
-	deleteResult, err := getProjectStatus(`{"title":"crud-project","operation":"delete","data":{}}`)
+	deleteResult, err := getProjectStatus(ctx, `{"title":"crud-project","operation":"delete","data":{}}`)
 	if err != nil {
 		t.Fatalf("delete returned error: %v", err)
 	}
@@ -313,7 +318,7 @@ func TestGetProjectStatusCRUDErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := getProjectStatus(tt.rawArgs)
+			_, err := getProjectStatus(context.Background(), tt.rawArgs)
 			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("error=%v, want it to contain %q", err, tt.wantError)
 			}
@@ -384,4 +389,141 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestHandleToolError(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "invalid argument", err: &AgentError{Kind: InvalidArgument, Message: "bad args"}, want: "allow it to fix arguments"},
+		{name: "business error", err: &AgentError{Kind: BusinessError, Message: "not found"}, want: "do not retry"},
+		{name: "network error", err: &AgentError{Kind: NetworkError, Message: "connection refused"}, want: "limited retry"},
+		{name: "timeout error", err: &AgentError{Kind: TimeoutError, Message: "deadline exceeded"}, want: "stop: timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := handleToolError(ctx, tt.err); !strings.Contains(got, tt.want) {
+				t.Fatalf("action=%q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("context timeout takes priority", func(t *testing.T) {
+		deadline, cancel := context.WithTimeout(context.Background(), 0)
+		defer cancel()
+		if got := handleToolError(deadline, &AgentError{Kind: NetworkError, Message: "late"}); got != "stop: timeout" {
+			t.Fatalf("action=%q, want stop: timeout", got)
+		}
+	})
+}
+
+func TestClassifyToolError(t *testing.T) {
+	want := &AgentError{Kind: InvalidArgument, Message: "bad args"}
+	if got := classifyToolError(want); got != want {
+		t.Fatal("classifyToolError should preserve AgentError")
+	}
+
+	got := classifyToolError(errors.New("plain failure"))
+	if got.Kind != BusinessError {
+		t.Fatalf("kind=%q, want %q", got.Kind, BusinessError)
+	}
+}
+
+func TestRequestCompletionTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+
+	resp, err := requestCompletion(ctx, newClient(), nil, nil, 1)
+	if resp != nil {
+		t.Fatal("timed out request should not return a response")
+	}
+	if err == nil {
+		t.Fatal("timed out request should return an error")
+	}
+
+	var agentErr *AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("error=%T, want *AgentError", err)
+	}
+	if agentErr.Kind != TimeoutError {
+		t.Fatalf("error kind=%q, want %q", agentErr.Kind, TimeoutError)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context deadline exceeded to be preserved", err)
+	}
+}
+
+func TestGetFirstChoice(t *testing.T) {
+	wantChoice := openai.ChatCompletionChoice{Index: 0}
+	tests := []struct {
+		name    string
+		resp    *openai.ChatCompletion
+		wantErr string
+	}{
+		{name: "nil response", resp: nil, wantErr: "model response is nil"},
+		{name: "nil choices", resp: &openai.ChatCompletion{Choices: nil}, wantErr: "choices in model response is nil"},
+		{name: "empty choices", resp: &openai.ChatCompletion{Choices: []openai.ChatCompletionChoice{}}, wantErr: "model returned no choices"},
+		{name: "normal response", resp: &openai.ChatCompletion{Choices: []openai.ChatCompletionChoice{wantChoice}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getFirstChoice(tt.resp)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != "model_error: "+tt.wantErr {
+					t.Fatalf("error=%v, want model_error: %s", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Index != wantChoice.Index {
+				t.Fatalf("choice index=%d, want %d", got.Index, wantChoice.Index)
+			}
+		})
+	}
+}
+
+func TestShouldStopBusinessRetry(t *testing.T) {
+	failures := make(map[string]int)
+	key := "get_project_status\x00{\"title\":\"missing\"}"
+
+	if shouldStopBusinessRetry(failures, key, BusinessError) {
+		t.Fatal("first business error should be allowed to return to the LLM")
+	}
+	if !shouldStopBusinessRetry(failures, key, BusinessError) {
+		t.Fatal("repeated business error should stop retrying")
+	}
+	if shouldStopBusinessRetry(failures, key, InvalidArgument) {
+		t.Fatal("invalid argument should not use business retry protection")
+	}
+}
+
+func TestExceededRecoveryLimit(t *testing.T) {
+	if exceededRecoveryLimit(2, 2) {
+		t.Fatal("recovery count at the limit should still be allowed")
+	}
+	if !exceededRecoveryLimit(3, 2) {
+		t.Fatal("recovery count over the limit should stop the agent")
+	}
+}
+
+func TestToolHandlerContextTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+
+	_, err := dispatchTool(ctx, "calculator", `{"a":1,"b":2,"operation":"add"}`)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context deadline exceeded", err)
+	}
+
+	agentErr := classifyToolError(err)
+	if agentErr.Kind != TimeoutError {
+		t.Fatalf("error kind=%q, want %q", agentErr.Kind, TimeoutError)
+	}
 }

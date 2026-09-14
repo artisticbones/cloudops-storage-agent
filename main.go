@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -15,11 +16,13 @@ import (
 )
 
 const (
-	ollamaAPIKey  = "ollama"
-	ollamaBaseURL = "http://localhost:11434/v1/"
-	ollamaModel   = "qwen3:1.7b"
-	maxSteps      = 5
-	toolName      = "calculator"
+	ollamaAPIKey      = "ollama"
+	ollamaBaseURL     = "http://localhost:11434/v1/"
+	ollamaModel       = "qwen3:1.7b"
+	maxSteps          = 5
+	maxRetries        = 2
+	maxToolRecoveries = 2
+	toolName          = "calculator"
 )
 
 var projectDataBase = map[string]map[string]any{
@@ -58,13 +61,15 @@ type calculatorArgs struct {
 type traceEvent struct {
 	Step      int    `json:"step"`
 	Event     string `json:"event"`
+	Attempt   int    `json:"attempt,omitempty"`
 	Tool      string `json:"tool,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 	Result    string `json:"result,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
-type ToolHandler func(rawArgs string) (string, error)
+type ToolHandler func(ctx context.Context, rawArgs string) (string, error)
 
 var toolRegistry = map[string]ToolHandler{
 	"calculator":         executeCalculator,
@@ -92,23 +97,32 @@ func main() {
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage(input),
 	}
+	businessErrorCalls := make(map[string]int)
+	toolRecoveryCount := 0
 
 	for step := 1; step <= maxSteps; step++ {
-		resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Messages: messages,
-			Model:    openai.ChatModel(ollamaModel),
-			Tools:    tools,
-		})
+		resp, err := requestCompletion(ctx, client, messages, tools, step)
 		if err != nil {
-			panic(fmt.Errorf("agent loop step %d: %w", step, err))
+			agentErr := classifyRuntimeError(ctx, err)
+			writeTrace(traceEvent{Step: step, Event: "agent_error", Error: agentErr.Error()})
+			writeTrace(traceEvent{Step: step, Event: "agent_stopped", Reason: string(agentErr.Kind), Error: agentErr.Error()})
+			fmt.Printf("Agent 已安全停止：%s\n", agentErr)
+			return
 		}
 
 		writeTrace(traceEvent{Step: step, Event: "model_response"})
-		if len(resp.Choices) == 0 {
-			panic(fmt.Errorf("agent loop step %d: model returned no choices", step))
+		choice, err := getFirstChoice(resp)
+		if err != nil {
+			var agentErr *AgentError
+			if !errors.As(err, &agentErr) {
+				agentErr = classifyRuntimeError(ctx, err)
+			}
+			writeTrace(traceEvent{Step: step, Event: "agent_stopped", Reason: string(agentErr.Kind), Error: agentErr.Error()})
+			fmt.Printf("Agent 已安全停止：%s\n", agentErr)
+			return
 		}
 
-		message := resp.Choices[0].Message
+		message := choice.Message
 		if len(message.ToolCalls) == 0 {
 			answer := message.Content
 			fmt.Println(answer)
@@ -127,9 +141,22 @@ func main() {
 				Arguments: functionCall.Function.Arguments,
 			})
 
-			result, err := dispatchTool(functionCall.Function.Name, functionCall.Function.Arguments)
+			result, err := dispatchTool(ctx, functionCall.Function.Name, functionCall.Function.Arguments)
 			if err != nil {
-				writeTrace(traceEvent{Step: step, Event: "tool_error", Tool: functionCall.Function.Name, Error: err.Error()})
+				agentErr := classifyToolError(err)
+				writeTrace(traceEvent{Step: step, Event: "tool_error", Tool: functionCall.Function.Name, Error: agentErr.Error()})
+				toolRecoveryCount++
+				if exceededRecoveryLimit(toolRecoveryCount, maxToolRecoveries) {
+					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "max_tool_recoveries", Attempt: toolRecoveryCount, Error: fmt.Sprintf("limit:%d", maxToolRecoveries)})
+					fmt.Printf("Agent 已安全停止：工具恢复次数达到上限 %d\n", maxToolRecoveries)
+					return
+				}
+				if shouldStopBusinessRetry(businessErrorCalls, functionCall.Function.Name+"\x00"+functionCall.Function.Arguments, agentErr.Kind) {
+					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "business_error_repeated", Error: agentErr.Error()})
+					fmt.Println("工具执行失败：相同业务错误已重复，停止重试")
+					return
+				}
+				writeTrace(traceEvent{Step: step, Event: "retry", Tool: functionCall.Function.Name, Attempt: toolRecoveryCount, Reason: string(agentErr.Kind)})
 				result = "工具执行失败：" + err.Error()
 			} else {
 				writeTrace(traceEvent{Step: step, Event: "tool_result", Tool: functionCall.Function.Name, Result: result})
@@ -140,7 +167,82 @@ func main() {
 		}
 	}
 
-	panic(fmt.Sprintf("agent stopped: reached max steps (%d)", maxSteps))
+	writeTrace(traceEvent{Step: maxSteps, Event: "agent_stopped", Reason: "max_steps", Error: fmt.Sprintf("limit:%d", maxSteps)})
+	fmt.Printf("Agent 已安全停止：达到最大步数 %d\n", maxSteps)
+}
+
+func requestCompletion(ctx context.Context, client openai.Client, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolUnionParam, step int) (*openai.ChatCompletion, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries+1; attempt++ {
+		resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+			Messages: messages,
+			Model:    openai.ChatModel(ollamaModel),
+			Tools:    tools,
+		})
+		if err == nil {
+			return resp, nil
+		}
+
+		lastErr = err
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || attempt > maxRetries {
+			break
+		}
+		classified := classifyRuntimeError(ctx, err)
+		writeTrace(traceEvent{Step: step, Event: "retry", Attempt: attempt, Reason: string(classified.Kind), Error: classified.Error()})
+	}
+	return nil, classifyRuntimeError(ctx, lastErr)
+}
+
+func classifyRuntimeError(ctx context.Context, err error) *AgentError {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &AgentError{Kind: TimeoutError, Message: "agent context deadline exceeded", Err: ctx.Err()}
+	}
+	return &AgentError{Kind: NetworkError, Message: err.Error(), Err: err}
+}
+
+func classifyToolError(err error) *AgentError {
+	var agentErr *AgentError
+	if errors.As(err, &agentErr) {
+		return agentErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &AgentError{Kind: TimeoutError, Message: "tool execution timed out", Err: err}
+	}
+	return &AgentError{Kind: BusinessError, Message: err.Error(), Err: err}
+}
+
+func getFirstChoice(resp *openai.ChatCompletion) (openai.ChatCompletionChoice, error) {
+	if resp == nil {
+		return openai.ChatCompletionChoice{}, &AgentError{
+			Kind:    ModelError,
+			Message: "model response is nil",
+		}
+	}
+	if resp.Choices == nil {
+		return openai.ChatCompletionChoice{}, &AgentError{
+			Kind:    ModelError,
+			Message: "choices in model response is nil",
+		}
+	}
+	if len(resp.Choices) == 0 {
+		return openai.ChatCompletionChoice{}, &AgentError{
+			Kind:    ModelError,
+			Message: "model returned no choices",
+		}
+	}
+	return resp.Choices[0], nil
+}
+
+func shouldStopBusinessRetry(failures map[string]int, key string, kind ErrorKind) bool {
+	if kind != BusinessError {
+		return false
+	}
+	failures[key]++
+	return failures[key] > 1
+}
+
+func exceededRecoveryLimit(recoveryCount, maxRecoveries int) bool {
+	return recoveryCount > maxRecoveries
 }
 
 func newClient() openai.Client {
@@ -148,6 +250,30 @@ func newClient() openai.Client {
 		option.WithAPIKey(ollamaAPIKey),
 		option.WithBaseURL(ollamaBaseURL),
 	)
+}
+
+func handleToolError(ctx context.Context, err error) (action string) {
+	var agentErr *AgentError
+
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "stop: timeout"
+	case errors.As(err, &agentErr):
+		switch agentErr.Kind {
+		case InvalidArgument:
+			return "return error to LLM and allow it to fix arguments"
+		case BusinessError:
+			return "return business error to LLM, do not retry"
+		case ModelError, NetworkError:
+			return "retry with a limited retry count"
+		case TimeoutError:
+			return "stop: timeout"
+		}
+	default:
+		return "stop: unknown error"
+	}
+
+	return "stop: unhandled error"
 }
 
 func calculatorTool() openai.ChatCompletionToolUnionParam {
@@ -191,79 +317,86 @@ func getProjectStatusTool() openai.ChatCompletionToolUnionParam {
 	})
 }
 
-func dispatchTool(name, rawArgs string) (string, error) {
+func dispatchTool(ctx context.Context, name, rawArgs string) (string, error) {
 	handler, ok := toolRegistry[name]
 	if !ok {
-		return "", fmt.Errorf("unknown tool: %s", name)
+		return "", &AgentError{Kind: ModelError, Message: "unknown tool: " + name}
 	}
 	if handler == nil {
-		return "", fmt.Errorf("tool is not implemented: %s", name)
+		return "", &AgentError{Kind: ModelError, Message: "tool is not implemented: " + name}
 	}
 
-	return handler(rawArgs)
+	return handler(ctx, rawArgs)
 }
 
-func getProjectStatus(rawArgs string) (string, error) {
+func getProjectStatus(ctx context.Context, rawArgs string) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	var args getProjectStatusArgs
 
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
-		return "", err
+		return "", &AgentError{Kind: InvalidArgument, Message: "invalid project arguments", Err: err}
 	}
 
 	switch args.Operation {
 	case "query":
-		project, _, err := findProject(args.ProjectId, args.Title)
+		project, _, err := findProject(ctx, args.ProjectId, args.Title)
 		if err != nil {
 			return "", err
 		}
 		return formatProjectResult(args, project)
 	case "update":
-		project, _, err := findProject(args.ProjectId, args.Title)
+		project, _, err := findProject(ctx, args.ProjectId, args.Title)
 		if err != nil {
 			return "", err
 		}
 		if len(args.Data) == 0 {
-			return "", fmt.Errorf("data cannot be empty for update")
+			return "", &AgentError{Kind: InvalidArgument, Message: "data cannot be empty for update"}
 		}
-		if err := updateProject(project, args.Data); err != nil {
+		if err := updateProject(ctx, project, args.Data); err != nil {
 			return "", err
 		}
 		return formatProjectResult(args, project)
 	case "add":
 		if args.Title == "" {
-			return "", fmt.Errorf("title cannot be empty for add")
+			return "", &AgentError{Kind: InvalidArgument, Message: "title cannot be empty for add"}
 		}
 		if _, ok := projectDataBase[args.Title]; ok {
-			return "", fmt.Errorf("project already exists: %s", args.Title)
+			return "", &AgentError{Kind: BusinessError, Message: "project already exists: " + args.Title}
 		}
 		if args.ProjectId == 0 {
-			args.ProjectId = nextProjectID()
+			projectID, err := nextProjectID(ctx)
+			if err != nil {
+				return "", err
+			}
+			args.ProjectId = projectID
 		}
 		project := map[string]any{
 			"projectId": args.ProjectId,
 			"title":     args.Title,
 		}
-		if err := updateProject(project, args.Data); err != nil {
+		if err := updateProject(ctx, project, args.Data); err != nil {
 			return "", err
 		}
 		projectDataBase[args.Title] = project
 		return formatProjectResult(args, project)
 	case "delete":
-		_, key, err := findProject(args.ProjectId, args.Title)
+		_, key, err := findProject(ctx, args.ProjectId, args.Title)
 		if err != nil {
 			return "", err
 		}
 		delete(projectDataBase, key)
 		return fmt.Sprintf("title=%s, projectId=%d, operation=delete, result=deleted", args.Title, args.ProjectId), nil
 	default:
-		return "", fmt.Errorf("unknown operation: %s", args.Operation)
+		return "", &AgentError{Kind: InvalidArgument, Message: "unknown operation: " + args.Operation}
 	}
 
 }
 
-func findProject(projectID int, title string) (map[string]any, string, error) {
+func findProject(ctx context.Context, projectID int, title string) (map[string]any, string, error) {
 	if projectID == 0 && title == "" {
-		return nil, "", fmt.Errorf("projectId and title cannot both be empty")
+		return nil, "", &AgentError{Kind: InvalidArgument, Message: "projectId and title cannot both be empty"}
 	}
 
 	if title != "" {
@@ -276,6 +409,9 @@ func findProject(projectID int, title string) (map[string]any, string, error) {
 
 	if projectID != 0 {
 		for key, project := range projectDataBase {
+			if err := contextErr(ctx); err != nil {
+				return nil, "", err
+			}
 			if project["projectId"] == projectID {
 				return project, key, nil
 			}
@@ -283,31 +419,37 @@ func findProject(projectID int, title string) (map[string]any, string, error) {
 	}
 
 	if title != "" {
-		return nil, "", fmt.Errorf("no record for %s", title)
+		return nil, "", &AgentError{Kind: BusinessError, Message: "no record for " + title}
 	}
-	return nil, "", fmt.Errorf("no record for projectId %d", projectID)
+	return nil, "", &AgentError{Kind: BusinessError, Message: fmt.Sprintf("no record for projectId %d", projectID)}
 }
 
-func updateProject(project map[string]any, data map[string]string) error {
+func updateProject(ctx context.Context, project map[string]any, data map[string]string) error {
 	for field, value := range data {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
 		switch field {
 		case "status", "assignor", "assignee", "description":
 			project[field] = value
 		default:
-			return fmt.Errorf("unsupported project field: %s", field)
+			return &AgentError{Kind: InvalidArgument, Message: "unsupported project field: " + field}
 		}
 	}
 	return nil
 }
 
-func nextProjectID() int {
+func nextProjectID(ctx context.Context) (int, error) {
 	nextID := 1
 	for _, project := range projectDataBase {
+		if err := contextErr(ctx); err != nil {
+			return 0, err
+		}
 		if projectID, ok := project["projectId"].(int); ok && projectID >= nextID {
 			nextID = projectID + 1
 		}
 	}
-	return nextID
+	return nextID, nil
 }
 
 func formatProjectResult(args getProjectStatusArgs, project map[string]any) (string, error) {
@@ -318,14 +460,20 @@ func formatProjectResult(args getProjectStatusArgs, project map[string]any) (str
 	return fmt.Sprintf("title=%v, projectId=%v, operation=%s, result=%s", project["title"], project["projectId"], args.Operation, string(body)), nil
 }
 
-func executeCalculator(rawArgs string) (string, error) {
+func executeCalculator(ctx context.Context, rawArgs string) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	var args calculatorArgs
 
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
-		return "", err
+		return "", &AgentError{Kind: InvalidArgument, Message: "invalid calculator arguments", Err: err}
 	}
 
 	var result float64
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 
 	switch args.Operation {
 	case "add":
@@ -336,11 +484,11 @@ func executeCalculator(rawArgs string) (string, error) {
 		result = args.A * args.B
 	case "divide":
 		if args.B == 0 {
-			return "", fmt.Errorf("division by zero")
+			return "", &AgentError{Kind: BusinessError, Message: "division by zero"}
 		}
 		result = args.A / args.B
 	default:
-		return "", fmt.Errorf("unsupported operation: %s", args.Operation)
+		return "", &AgentError{Kind: InvalidArgument, Message: "unsupported operation: " + args.Operation}
 
 	}
 
@@ -351,5 +499,17 @@ func writeTrace(event traceEvent) {
 	data, err := json.Marshal(event)
 	if err == nil {
 		fmt.Println(string(data))
+	}
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
 	}
 }
