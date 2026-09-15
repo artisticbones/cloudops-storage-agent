@@ -8,21 +8,15 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
+	"github.com/artisticbones/hello-agent/config"
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
 )
 
 const (
-	ollamaAPIKey      = "ollama"
-	ollamaBaseURL     = "http://localhost:11434/v1/"
-	ollamaModel       = "qwen3:1.7b"
-	maxSteps          = 5
-	maxRetries        = 2
-	maxToolRecoveries = 2
-	toolName          = "calculator"
+	toolName = "calculator"
 )
 
 var projectDataBase = map[string]map[string]any{
@@ -78,10 +72,15 @@ var toolRegistry = map[string]ToolHandler{
 }
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		panic(fmt.Errorf("load config: %w", err))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancel()
 
-	client := newClient()
+	client := newClient(cfg)
 	tools := []openai.ChatCompletionToolUnionParam{calculatorTool(), getProjectStatusTool()}
 
 	fmt.Print("请输入问题：")
@@ -100,8 +99,8 @@ func main() {
 	businessErrorCalls := make(map[string]int)
 	toolRecoveryCount := 0
 
-	for step := 1; step <= maxSteps; step++ {
-		resp, err := requestCompletion(ctx, client, messages, tools, step)
+	for step := 1; step <= cfg.MaxSteps; step++ {
+		resp, err := requestCompletion(ctx, client, cfg, messages, tools, step)
 		if err != nil {
 			agentErr := classifyRuntimeError(ctx, err)
 			writeTrace(traceEvent{Step: step, Event: "agent_error", Error: agentErr.Error()})
@@ -146,9 +145,9 @@ func main() {
 				agentErr := classifyToolError(err)
 				writeTrace(traceEvent{Step: step, Event: "tool_error", Tool: functionCall.Function.Name, Error: agentErr.Error()})
 				toolRecoveryCount++
-				if exceededRecoveryLimit(toolRecoveryCount, maxToolRecoveries) {
-					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "max_tool_recoveries", Attempt: toolRecoveryCount, Error: fmt.Sprintf("limit:%d", maxToolRecoveries)})
-					fmt.Printf("Agent 已安全停止：工具恢复次数达到上限 %d\n", maxToolRecoveries)
+				if exceededRecoveryLimit(toolRecoveryCount, cfg.Tool.MaxToolRecoveries) {
+					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "max_tool_recoveries", Attempt: toolRecoveryCount, Error: fmt.Sprintf("limit:%d", cfg.Tool.MaxToolRecoveries)})
+					fmt.Printf("Agent 已安全停止：工具恢复次数达到上限 %d\n", cfg.Tool.MaxToolRecoveries)
 					return
 				}
 				if shouldStopBusinessRetry(businessErrorCalls, functionCall.Function.Name+"\x00"+functionCall.Function.Arguments, agentErr.Kind) {
@@ -167,16 +166,16 @@ func main() {
 		}
 	}
 
-	writeTrace(traceEvent{Step: maxSteps, Event: "agent_stopped", Reason: "max_steps", Error: fmt.Sprintf("limit:%d", maxSteps)})
-	fmt.Printf("Agent 已安全停止：达到最大步数 %d\n", maxSteps)
+	writeTrace(traceEvent{Step: cfg.MaxSteps, Event: "agent_stopped", Reason: "max_steps", Error: fmt.Sprintf("limit:%d", cfg.MaxSteps)})
+	fmt.Printf("Agent 已安全停止：达到最大步数 %d\n", cfg.MaxSteps)
 }
 
-func requestCompletion(ctx context.Context, client openai.Client, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolUnionParam, step int) (*openai.ChatCompletion, error) {
+func requestCompletion(ctx context.Context, client openai.Client, cfg *config.Config, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolUnionParam, step int) (*openai.ChatCompletion, error) {
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries+1; attempt++ {
+	for attempt := 1; attempt <= cfg.MaxRetries+1; attempt++ {
 		resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Messages: messages,
-			Model:    openai.ChatModel(ollamaModel),
+			Model:    openai.ChatModel(cfg.Model.Name),
 			Tools:    tools,
 		})
 		if err == nil {
@@ -184,7 +183,7 @@ func requestCompletion(ctx context.Context, client openai.Client, messages []ope
 		}
 
 		lastErr = err
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || attempt > maxRetries {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || attempt > cfg.MaxRetries {
 			break
 		}
 		classified := classifyRuntimeError(ctx, err)
@@ -245,10 +244,10 @@ func exceededRecoveryLimit(recoveryCount, maxRecoveries int) bool {
 	return recoveryCount > maxRecoveries
 }
 
-func newClient() openai.Client {
+func newClient(cfg *config.Config) openai.Client {
 	return openai.NewClient(
-		option.WithAPIKey(ollamaAPIKey),
-		option.WithBaseURL(ollamaBaseURL),
+		option.WithAPIKey(cfg.Model.APIKey),
+		option.WithBaseURL(cfg.Model.BaseURL),
 	)
 }
 

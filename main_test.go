@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/artisticbones/hello-agent/config"
 	openai "github.com/openai/openai-go/v3"
 )
 
@@ -437,7 +438,12 @@ func TestRequestCompletionTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
 
-	resp, err := requestCompletion(ctx, newClient(), nil, nil, 1)
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	resp, err := requestCompletion(ctx, newClient(cfg), cfg, nil, nil, 1)
 	if resp != nil {
 		t.Fatal("timed out request should not return a response")
 	}
