@@ -138,19 +138,14 @@ func TestDispatchTool(t *testing.T) {
 
 func TestCalculatorToolSchema(t *testing.T) {
 	tool := calculatorTool()
-	if tool.OfFunction == nil {
-		t.Fatal("calculator tool should contain a function definition")
+	if tool.Name != toolName {
+		t.Fatalf("tool name=%q, want %q", tool.Name, toolName)
 	}
-
-	fn := tool.OfFunction.Function
-	if fn.Name != toolName {
-		t.Fatalf("tool name=%q, want %q", fn.Name, toolName)
-	}
-	if !fn.Strict.Valid() || !fn.Strict.Value {
+	if !tool.Strict {
 		t.Fatal("calculator tool should use strict arguments")
 	}
 
-	properties, ok := fn.Parameters["properties"].(map[string]any)
+	properties, ok := tool.Parameters["properties"].(map[string]any)
 	if !ok {
 		t.Fatal("tool schema should contain properties")
 	}
@@ -329,19 +324,14 @@ func TestGetProjectStatusCRUDErrors(t *testing.T) {
 
 func TestGetProjectStatusToolSchema(t *testing.T) {
 	tool := getProjectStatusTool()
-	if tool.OfFunction == nil {
-		t.Fatal("get project status tool should contain a function definition")
+	if tool.Name != "get_project_status" {
+		t.Fatalf("tool name=%q, want %q", tool.Name, "get_project_status")
 	}
-
-	fn := tool.OfFunction.Function
-	if fn.Name != "get_project_status" {
-		t.Fatalf("tool name=%q, want %q", fn.Name, "get_project_status")
-	}
-	if !fn.Strict.Valid() || !fn.Strict.Value {
+	if !tool.Strict {
 		t.Fatal("get project status tool should use strict arguments")
 	}
 
-	properties, ok := fn.Parameters["properties"].(map[string]any)
+	properties, ok := tool.Parameters["properties"].(map[string]any)
 	if !ok {
 		t.Fatal("tool schema should contain properties")
 	}
@@ -351,7 +341,7 @@ func TestGetProjectStatusToolSchema(t *testing.T) {
 		}
 	}
 
-	required, ok := fn.Parameters["required"].([]string)
+	required, ok := tool.Parameters["required"].([]string)
 	if !ok {
 		t.Fatal("tool schema should contain required fields")
 	}
@@ -361,7 +351,7 @@ func TestGetProjectStatusToolSchema(t *testing.T) {
 		}
 	}
 
-	additionalProperties, ok := fn.Parameters["additionalProperties"].(bool)
+	additionalProperties, ok := tool.Parameters["additionalProperties"].(bool)
 	if !ok || additionalProperties {
 		t.Fatal("tool schema should reject unknown top-level parameters")
 	}
@@ -443,7 +433,8 @@ func TestRequestCompletionTimeout(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 
-	resp, err := requestCompletion(ctx, newClient(cfg), cfg, nil, nil, 1)
+	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
+	resp, err := requestCompletion(ctx, client, cfg, ModelRequest{}, 1)
 	if resp != nil {
 		t.Fatal("timed out request should not return a response")
 	}

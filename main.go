@@ -12,7 +12,6 @@ import (
 	"github.com/artisticbones/hello-agent/config"
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
-	"github.com/openai/openai-go/v3/shared"
 )
 
 const (
@@ -80,8 +79,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancel()
 
-	client := newClient(cfg)
-	tools := []openai.ChatCompletionToolUnionParam{calculatorTool(), getProjectStatusTool()}
+	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
+	tools := []ToolDefinition{calculatorTool(), getProjectStatusTool()}
 
 	fmt.Print("请输入问题：")
 	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -93,91 +92,22 @@ func main() {
 		panic("user input cannot be empty")
 	}
 
-	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.UserMessage(input),
+	agent, err := NewAgent(client, cfg, tools)
+	if err != nil {
+		panic(fmt.Errorf("create agent: %w", err))
 	}
-	businessErrorCalls := make(map[string]int)
-	toolRecoveryCount := 0
-
-	for step := 1; step <= cfg.MaxSteps; step++ {
-		resp, err := requestCompletion(ctx, client, cfg, messages, tools, step)
-		if err != nil {
-			agentErr := classifyRuntimeError(ctx, err)
-			writeTrace(traceEvent{Step: step, Event: "agent_error", Error: agentErr.Error()})
-			writeTrace(traceEvent{Step: step, Event: "agent_stopped", Reason: string(agentErr.Kind), Error: agentErr.Error()})
-			fmt.Printf("Agent 已安全停止：%s\n", agentErr)
-			return
-		}
-
-		writeTrace(traceEvent{Step: step, Event: "model_response"})
-		choice, err := getFirstChoice(resp)
-		if err != nil {
-			var agentErr *AgentError
-			if !errors.As(err, &agentErr) {
-				agentErr = classifyRuntimeError(ctx, err)
-			}
-			writeTrace(traceEvent{Step: step, Event: "agent_stopped", Reason: string(agentErr.Kind), Error: agentErr.Error()})
-			fmt.Printf("Agent 已安全停止：%s\n", agentErr)
-			return
-		}
-
-		message := choice.Message
-		if len(message.ToolCalls) == 0 {
-			answer := message.Content
-			fmt.Println(answer)
-			writeTrace(traceEvent{Step: step, Event: "final_answer", Result: answer})
-			return
-		}
-
-		// 下一轮请求必须带上模型刚刚发出的 assistant tool call。
-		messages = append(messages, message.ToParam())
-		for _, toolCall := range message.ToolCalls {
-			functionCall := toolCall.AsFunction()
-			writeTrace(traceEvent{
-				Step:      step,
-				Event:     "tool_call",
-				Tool:      functionCall.Function.Name,
-				Arguments: functionCall.Function.Arguments,
-			})
-
-			result, err := dispatchTool(ctx, functionCall.Function.Name, functionCall.Function.Arguments)
-			if err != nil {
-				agentErr := classifyToolError(err)
-				writeTrace(traceEvent{Step: step, Event: "tool_error", Tool: functionCall.Function.Name, Error: agentErr.Error()})
-				toolRecoveryCount++
-				if exceededRecoveryLimit(toolRecoveryCount, cfg.Tool.MaxToolRecoveries) {
-					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "max_tool_recoveries", Attempt: toolRecoveryCount, Error: fmt.Sprintf("limit:%d", cfg.Tool.MaxToolRecoveries)})
-					fmt.Printf("Agent 已安全停止：工具恢复次数达到上限 %d\n", cfg.Tool.MaxToolRecoveries)
-					return
-				}
-				if shouldStopBusinessRetry(businessErrorCalls, functionCall.Function.Name+"\x00"+functionCall.Function.Arguments, agentErr.Kind) {
-					writeTrace(traceEvent{Step: step, Event: "agent_stopped", Tool: functionCall.Function.Name, Reason: "business_error_repeated", Error: agentErr.Error()})
-					fmt.Println("工具执行失败：相同业务错误已重复，停止重试")
-					return
-				}
-				writeTrace(traceEvent{Step: step, Event: "retry", Tool: functionCall.Function.Name, Attempt: toolRecoveryCount, Reason: string(agentErr.Kind)})
-				result = "工具执行失败：" + err.Error()
-			} else {
-				writeTrace(traceEvent{Step: step, Event: "tool_result", Tool: functionCall.Function.Name, Result: result})
-			}
-
-			// 工具结果必须使用同一个 call ID，模型才能把结果对应回这次调用。
-			messages = append(messages, openai.ToolMessage(result, functionCall.ID))
-		}
+	answer, err := agent.Run(ctx, input)
+	if err != nil {
+		fmt.Printf("Agent 已安全停止：%s\n", err)
+		return
 	}
-
-	writeTrace(traceEvent{Step: cfg.MaxSteps, Event: "agent_stopped", Reason: "max_steps", Error: fmt.Sprintf("limit:%d", cfg.MaxSteps)})
-	fmt.Printf("Agent 已安全停止：达到最大步数 %d\n", cfg.MaxSteps)
+	fmt.Println(answer)
 }
 
-func requestCompletion(ctx context.Context, client openai.Client, cfg *config.Config, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolUnionParam, step int) (*openai.ChatCompletion, error) {
+func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Config, req ModelRequest, step int) (*ModelResponse, error) {
 	var lastErr error
 	for attempt := 1; attempt <= cfg.MaxRetries+1; attempt++ {
-		resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Messages: messages,
-			Model:    openai.ChatModel(cfg.Model.Name),
-			Tools:    tools,
-		})
+		resp, err := client.Complete(ctx, req)
 		if err == nil {
 			return resp, nil
 		}
@@ -275,12 +205,12 @@ func handleToolError(ctx context.Context, err error) (action string) {
 	return "stop: unhandled error"
 }
 
-func calculatorTool() openai.ChatCompletionToolUnionParam {
-	return openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
+func calculatorTool() ToolDefinition {
+	return ToolDefinition{
 		Name:        toolName,
-		Description: openai.String("执行两个数字的加减乘除运算"),
-		Strict:      openai.Bool(true),
-		Parameters: shared.FunctionParameters{
+		Description: "执行两个数字的加减乘除运算",
+		Strict:      true,
+		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"a":         map[string]any{"type": "number"},
@@ -290,15 +220,15 @@ func calculatorTool() openai.ChatCompletionToolUnionParam {
 			"required":             []string{"a", "b", "operation"},
 			"additionalProperties": false,
 		},
-	})
+	}
 }
 
-func getProjectStatusTool() openai.ChatCompletionToolUnionParam {
-	return openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
+func getProjectStatusTool() ToolDefinition {
+	return ToolDefinition{
 		Name:        "get_project_status",
-		Description: openai.String("查询、新增、更新或删除项目记录"),
-		Strict:      openai.Bool(true),
-		Parameters: shared.FunctionParameters{
+		Description: "查询、新增、更新或删除项目记录",
+		Strict:      true,
+		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"projectId": map[string]any{"type": "integer", "description": "项目 ID；不使用 ID 时传 0"},
@@ -313,7 +243,7 @@ func getProjectStatusTool() openai.ChatCompletionToolUnionParam {
 			"required":             []string{"projectId", "title", "operation", "data"},
 			"additionalProperties": false,
 		},
-	})
+	}
 }
 
 func dispatchTool(ctx context.Context, name, rawArgs string) (string, error) {
