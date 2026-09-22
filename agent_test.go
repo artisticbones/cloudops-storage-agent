@@ -25,6 +25,35 @@ func TestAgentLoopReturnsTextAndStops(t *testing.T) {
 	}
 }
 
+func TestAgentTraceRecordsWholeLoop(t *testing.T) {
+	client := NewFakeModelClient(
+		NewFakeCalculatorToolCallResult("call_1", `{"a":1,"b":2,"operation":"add"}`),
+		NewFakeTextResult("结果是 3"),
+	)
+	agent := newTestAgent(t, client, 3, 0)
+
+	if _, err := agent.Run(context.Background(), "1 + 2 等于多少"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	var events []string
+	for _, event := range agent.Trace().Events {
+		events = append(events, event.Event)
+	}
+	want := []string{
+		"agent_start", "model_request", "model_response", "tool_call", "tool_result",
+		"model_request", "model_response", "final_answer",
+	}
+	if len(events) != len(want) {
+		t.Fatalf("trace events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("trace event %d = %q, want %q; all=%v", i, events[i], want[i], events)
+		}
+	}
+}
+
 func TestAgentLoopExecutesToolAndReturnsResultToModel(t *testing.T) {
 	client := NewFakeModelClient(
 		NewFakeCalculatorToolCallResult("call_1", `{"a":123,"b":45,"operation":"add"}`),
@@ -153,7 +182,11 @@ func newTestAgent(t *testing.T, client *FakeModelClient, maxSteps, maxRetries in
 		Model:          &config.ModelConfig{Name: "fake", BaseURL: "fake://model"},
 		Tool:           &config.ToolConfig{MaxToolRecoveries: 2},
 	}
-	agent, err := NewAgent(client, cfg, []ToolDefinition{calculatorTool()})
+	registry := NewToolRegistry()
+	if err := registry.Register(calculatorTool()); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	agent, err := NewAgent(client, cfg, registry)
 	if err != nil {
 		t.Fatalf("NewAgent() error = %v", err)
 	}

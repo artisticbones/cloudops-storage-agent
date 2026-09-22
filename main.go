@@ -51,25 +51,6 @@ type calculatorArgs struct {
 	Operation string  `json:"operation"`
 }
 
-type traceEvent struct {
-	Step      int    `json:"step"`
-	Event     string `json:"event"`
-	Attempt   int    `json:"attempt,omitempty"`
-	Tool      string `json:"tool,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
-	Result    string `json:"result,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-}
-
-type ToolHandler func(ctx context.Context, rawArgs string) (string, error)
-
-var toolRegistry = map[string]ToolHandler{
-	"calculator":         executeCalculator,
-	"get_project_status": getProjectStatus,
-	"break_down_tasks":   nil,
-}
-
 func main() {
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -80,7 +61,12 @@ func main() {
 	defer cancel()
 
 	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
-	tools := []ToolDefinition{calculatorTool(), getProjectStatusTool()}
+	registry := NewToolRegistry()
+	for _, tool := range []Tool{calculatorTool(), getProjectStatusTool()} {
+		if err := registry.Register(tool); err != nil {
+			panic(fmt.Errorf("register tool: %w", err))
+		}
+	}
 
 	fmt.Print("请输入问题：")
 	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -92,7 +78,7 @@ func main() {
 		panic("user input cannot be empty")
 	}
 
-	agent, err := NewAgent(client, cfg, tools)
+	agent, err := NewAgent(client, cfg, registry)
 	if err != nil {
 		panic(fmt.Errorf("create agent: %w", err))
 	}
@@ -104,7 +90,7 @@ func main() {
 	fmt.Println(answer)
 }
 
-func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Config, req ModelRequest, step int) (*ModelResponse, error) {
+func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Config, req ModelRequest, step int, trace *Trace) (*ModelResponse, error) {
 	var lastErr error
 	for attempt := 1; attempt <= cfg.MaxRetries+1; attempt++ {
 		resp, err := client.Complete(ctx, req)
@@ -117,7 +103,7 @@ func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Conf
 			break
 		}
 		classified := classifyRuntimeError(ctx, err)
-		writeTrace(traceEvent{Step: step, Event: "retry", Attempt: attempt, Reason: string(classified.Kind), Error: classified.Error()})
+		trace.Add(traceEvent{Step: step, Event: "retry", Attempt: attempt, Reason: string(classified.Kind), Error: classified.Error()})
 	}
 	return nil, classifyRuntimeError(ctx, lastErr)
 }
@@ -136,6 +122,9 @@ func classifyToolError(err error) *AgentError {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &AgentError{Kind: TimeoutError, Message: "tool execution timed out", Err: err}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &AgentError{Kind: TimeoutError, Message: "tool execution canceled", Err: err}
 	}
 	return &AgentError{Kind: BusinessError, Message: err.Error(), Err: err}
 }
@@ -205,57 +194,64 @@ func handleToolError(ctx context.Context, err error) (action string) {
 	return "stop: unhandled error"
 }
 
-func calculatorTool() ToolDefinition {
-	return ToolDefinition{
-		Name:        toolName,
-		Description: "执行两个数字的加减乘除运算",
-		Strict:      true,
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"a":         map[string]any{"type": "number"},
-				"b":         map[string]any{"type": "number"},
-				"operation": map[string]any{"type": "string", "enum": []string{"add", "subtract", "multiply", "divide"}},
-			},
-			"required":             []string{"a", "b", "operation"},
-			"additionalProperties": false,
-		},
-	}
-}
-
-func getProjectStatusTool() ToolDefinition {
-	return ToolDefinition{
-		Name:        "get_project_status",
-		Description: "查询、新增、更新或删除项目记录",
-		Strict:      true,
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"projectId": map[string]any{"type": "integer", "description": "项目 ID；不使用 ID 时传 0"},
-				"title":     map[string]any{"type": "string", "description": "项目标题；不使用标题时传空字符串"},
-				"operation": map[string]any{"type": "string", "enum": []string{"add", "update", "delete", "query"}, "description": "要执行的项目操作"},
-				"data": map[string]any{
-					"type":                 "object",
-					"description":          "新增或更新的项目字段；query 和 delete 时传空对象",
-					"additionalProperties": map[string]any{"type": "string"},
+func calculatorTool() Tool {
+	return &functionTool{
+		definition: ToolDefinition{
+			Name:        toolName,
+			Description: "执行两个数字的加减乘除运算",
+			Strict:      true,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"a":         map[string]any{"type": "number"},
+					"b":         map[string]any{"type": "number"},
+					"operation": map[string]any{"type": "string", "enum": []string{"add", "subtract", "multiply", "divide"}},
 				},
+				"required":             []string{"a", "b", "operation"},
+				"additionalProperties": false,
 			},
-			"required":             []string{"projectId", "title", "operation", "data"},
-			"additionalProperties": false,
 		},
+		handler: executeCalculator,
 	}
 }
 
-func dispatchTool(ctx context.Context, name, rawArgs string) (string, error) {
-	handler, ok := toolRegistry[name]
+func getProjectStatusTool() Tool {
+	return &functionTool{
+		definition: ToolDefinition{
+			Name:        "get_project_status",
+			Description: "查询、新增、更新或删除项目记录",
+			Strict:      true,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"projectId": map[string]any{"type": "integer", "description": "项目 ID；不使用 ID 时传 0"},
+					"title":     map[string]any{"type": "string", "description": "项目标题；不使用标题时传空字符串"},
+					"operation": map[string]any{"type": "string", "enum": []string{"add", "update", "delete", "query"}, "description": "要执行的项目操作"},
+					"data": map[string]any{
+						"type":                 "object",
+						"description":          "新增或更新的项目字段；query 和 delete 时传空对象",
+						"additionalProperties": map[string]any{"type": "string"},
+					},
+				},
+				"required":             []string{"projectId", "title", "operation", "data"},
+				"additionalProperties": false,
+			},
+		},
+		handler: getProjectStatus,
+	}
+}
+
+func dispatchTool(ctx context.Context, registry ToolRegistry, name, rawArgs string) (string, error) {
+	tool, ok := registry.Find(name)
 	if !ok {
 		return "", &AgentError{Kind: ModelError, Message: "unknown tool: " + name}
 	}
-	if handler == nil {
-		return "", &AgentError{Kind: ModelError, Message: "tool is not implemented: " + name}
-	}
 
-	return handler(ctx, rawArgs)
+	result, err := tool.Execute(ctx, json.RawMessage(rawArgs))
+	if err != nil {
+		return "", err
+	}
+	return result.Content, nil
 }
 
 func getProjectStatus(ctx context.Context, rawArgs string) (string, error) {
@@ -422,13 +418,6 @@ func executeCalculator(ctx context.Context, rawArgs string) (string, error) {
 	}
 
 	return fmt.Sprintf("a=%g, b=%g, operation=%s, result=%g", args.A, args.B, args.Operation, result), nil
-}
-
-func writeTrace(event traceEvent) {
-	data, err := json.Marshal(event)
-	if err == nil {
-		fmt.Println(string(data))
-	}
 }
 
 func contextErr(ctx context.Context) error {

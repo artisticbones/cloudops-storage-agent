@@ -99,12 +99,6 @@ func TestDispatchTool(t *testing.T) {
 			wantError: "unknown tool",
 		},
 		{
-			name:      "registered but not implemented",
-			toolName:  "break_down_tasks",
-			rawArgs:   `{}`,
-			wantError: "tool is not implemented",
-		},
-		{
 			name:     "dispatch project status",
 			toolName: "get_project_status",
 			rawArgs:  `{"title":"test","operation":"query"}`,
@@ -114,7 +108,14 @@ func TestDispatchTool(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := dispatchTool(context.Background(), tt.toolName, tt.rawArgs)
+			registry := NewToolRegistry()
+			if err := registry.Register(calculatorTool()); err != nil {
+				t.Fatalf("register calculator: %v", err)
+			}
+			if err := registry.Register(getProjectStatusTool()); err != nil {
+				t.Fatalf("register project status: %v", err)
+			}
+			got, err := dispatchTool(context.Background(), registry, tt.toolName, tt.rawArgs)
 
 			if tt.wantError != "" {
 				if err == nil {
@@ -137,7 +138,7 @@ func TestDispatchTool(t *testing.T) {
 }
 
 func TestCalculatorToolSchema(t *testing.T) {
-	tool := calculatorTool()
+	tool := calculatorTool().Definition()
 	if tool.Name != toolName {
 		t.Fatalf("tool name=%q, want %q", tool.Name, toolName)
 	}
@@ -161,27 +162,27 @@ func TestCalculatorToolSchema(t *testing.T) {
 }
 
 func TestToolRegistry(t *testing.T) {
-	tests := []struct {
-		name       string
-		wantExists bool
-		wantNil    bool
-	}{
-		{name: "calculator", wantExists: true},
-		{name: "get_project_status", wantExists: true},
-		{name: "break_down_tasks", wantExists: true, wantNil: true},
-		{name: "unknown", wantExists: false},
+	registry := NewToolRegistry()
+	if err := registry.Register(calculatorTool()); err != nil {
+		t.Fatalf("register calculator: %v", err)
+	}
+	if err := registry.Register(getProjectStatusTool()); err != nil {
+		t.Fatalf("register project status: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			handler, ok := toolRegistry[tt.name]
-			if ok != tt.wantExists {
-				t.Fatalf("exists=%v, want %v", ok, tt.wantExists)
-			}
-			if ok && (handler == nil) != tt.wantNil {
-				t.Fatalf("handler nil=%v, want %v", handler == nil, tt.wantNil)
-			}
-		})
+	tool, ok := registry.Find("calculator")
+	if !ok || tool == nil {
+		t.Fatal("calculator should be registered")
+	}
+	if _, ok := registry.Find("unknown"); ok {
+		t.Fatal("unknown tool should not be found")
+	}
+	if len(registry.Definitions()) != 2 {
+		t.Fatalf("definitions count = %d, want 2", len(registry.Definitions()))
+	}
+
+	if err := registry.Register(calculatorTool()); err == nil {
+		t.Fatal("duplicate registration should fail")
 	}
 }
 
@@ -323,7 +324,7 @@ func TestGetProjectStatusCRUDErrors(t *testing.T) {
 }
 
 func TestGetProjectStatusToolSchema(t *testing.T) {
-	tool := getProjectStatusTool()
+	tool := getProjectStatusTool().Definition()
 	if tool.Name != "get_project_status" {
 		t.Fatalf("tool name=%q, want %q", tool.Name, "get_project_status")
 	}
@@ -434,7 +435,7 @@ func TestRequestCompletionTimeout(t *testing.T) {
 	}
 
 	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
-	resp, err := requestCompletion(ctx, client, cfg, ModelRequest{}, 1)
+	resp, err := requestCompletion(ctx, client, cfg, ModelRequest{}, 1, &Trace{})
 	if resp != nil {
 		t.Fatal("timed out request should not return a response")
 	}
@@ -514,7 +515,11 @@ func TestToolHandlerContextTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
 
-	_, err := dispatchTool(ctx, "calculator", `{"a":1,"b":2,"operation":"add"}`)
+	registry := NewToolRegistry()
+	if err := registry.Register(calculatorTool()); err != nil {
+		t.Fatalf("register calculator: %v", err)
+	}
+	_, err := dispatchTool(ctx, registry, "calculator", `{"a":1,"b":2,"operation":"add"}`)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want context deadline exceeded", err)
 	}

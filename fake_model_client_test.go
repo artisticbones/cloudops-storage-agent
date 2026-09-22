@@ -18,7 +18,7 @@ func TestFakeModelClientReturnsResponsesInOrder(t *testing.T) {
 	)
 	request := ModelRequest{
 		Messages: []Message{{Role: "user", Content: "123 + 45 等于多少"}},
-		Tools:    []ToolDefinition{calculatorTool()},
+		Tools:    []ToolDefinition{calculatorTool().Definition()},
 	}
 
 	response, err := client.Complete(context.Background(), request)
@@ -101,7 +101,11 @@ func TestAgentUsesInjectedFakeModelClient(t *testing.T) {
 		Model:          &config.ModelConfig{Name: "fake", BaseURL: "fake://model"},
 		Tool:           &config.ToolConfig{MaxToolRecoveries: 1},
 	}
-	agent, err := NewAgent(client, cfg, []ToolDefinition{calculatorTool()})
+	registry := NewToolRegistry()
+	if err := registry.Register(calculatorTool()); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	agent, err := NewAgent(client, cfg, registry)
 	if err != nil {
 		t.Fatalf("NewAgent() error = %v", err)
 	}
