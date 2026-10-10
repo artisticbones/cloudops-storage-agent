@@ -29,6 +29,12 @@ func TestLoadConfigUsesDefaults(t *testing.T) {
 	if cfg.Tool.MaxToolRecoveries != defaultMaxToolRecoveries {
 		t.Fatalf("MaxToolRecoveries = %d, want %d", cfg.Tool.MaxToolRecoveries, defaultMaxToolRecoveries)
 	}
+	if cfg.Diagnostics == nil || cfg.Diagnostics.PprofAddr != defaultPprofAddr {
+		t.Fatalf("unexpected diagnostics defaults: %+v", cfg.Diagnostics)
+	}
+	if cfg.Prompt == nil || cfg.Prompt.SystemPromptFile != defaultSystemPromptFile {
+		t.Fatalf("unexpected prompt defaults: %+v", cfg.Prompt)
+	}
 }
 
 func TestLoadConfigReadsEnvironment(t *testing.T) {
@@ -40,6 +46,8 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("AGENT_MAX_RETRIES", "3")
 	t.Setenv("AGENT_REQUEST_TIMEOUT", "45s")
 	t.Setenv("AGENT_MAX_TOOL_RECOVERIES", "4")
+	t.Setenv("AGENT_PPROF_ADDR", "127.0.0.1:6060")
+	t.Setenv("AGENT_SYSTEM_PROMPT_FILE", "test-system.md")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -51,6 +59,12 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	}
 	if cfg.MaxSteps != 8 || cfg.MaxRetries != 3 || cfg.RequestTimeout != 45*time.Second || cfg.Tool.MaxToolRecoveries != 4 {
 		t.Fatalf("unexpected runtime config: %+v", cfg)
+	}
+	if cfg.Diagnostics.PprofAddr != "127.0.0.1:6060" {
+		t.Fatalf("PprofAddr = %q, want %q", cfg.Diagnostics.PprofAddr, "127.0.0.1:6060")
+	}
+	if cfg.Prompt.SystemPromptFile != "test-system.md" {
+		t.Fatalf("SystemPromptFile = %q, want %q", cfg.Prompt.SystemPromptFile, "test-system.md")
 	}
 }
 
@@ -96,6 +110,7 @@ func validConfig(mutators ...func(*Config)) *Config {
 		RequestTimeout: time.Minute,
 		Model:          &ModelConfig{Name: "model", BaseURL: "http://localhost"},
 		Tool:           &ToolConfig{MaxToolRecoveries: 2},
+		Diagnostics:    &DiagnosticsConfig{},
 	}
 	for _, mutate := range mutators {
 		mutate(cfg)
@@ -113,6 +128,8 @@ func clearConfigEnv(t *testing.T) {
 		"AGENT_MAX_RETRIES",
 		"AGENT_REQUEST_TIMEOUT",
 		"AGENT_MAX_TOOL_RECOVERIES",
+		"AGENT_PPROF_ADDR",
+		"AGENT_SYSTEM_PROMPT_FILE",
 	} {
 		t.Setenv(key, "")
 	}

@@ -161,6 +161,35 @@ func TestCalculatorToolSchema(t *testing.T) {
 	}
 }
 
+func TestValidateToolCallRejectsOperationMismatch(t *testing.T) {
+	request := ModelRequest{Messages: []Message{{Role: "user", Content: "计算 123+23"}}}
+	err := validateToolCall(request, ToolCall{
+		Name:      toolName,
+		Arguments: `{"a":123,"b":23,"operation":"divide"}`,
+	})
+	if err == nil {
+		t.Fatal("validateToolCall() error = nil, want operation mismatch")
+	}
+	var agentErr *AgentError
+	if !errors.As(err, &agentErr) || agentErr.Kind != InvalidArgument {
+		t.Fatalf("error = %v, want InvalidArgument AgentError", err)
+	}
+	if !strings.Contains(err.Error(), "expected \"add\"") {
+		t.Fatalf("error = %q, want expected add", err.Error())
+	}
+}
+
+func TestValidateExpressionToolCallRejectsMutatedExpression(t *testing.T) {
+	request := ModelRequest{Messages: []Message{{Role: "user", Content: "计算 123 + 23 / 23"}}}
+	err := validateToolCall(request, ToolCall{
+		Name:      expressionCalculatorToolName,
+		Arguments: `{"expression":"123 + 23 / 23 /"}`,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("error = %v, want expression mismatch", err)
+	}
+}
+
 func TestToolRegistry(t *testing.T) {
 	registry := NewToolRegistry()
 	if err := registry.Register(calculatorTool()); err != nil {

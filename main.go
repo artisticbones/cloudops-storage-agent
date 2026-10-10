@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -57,37 +58,97 @@ func main() {
 		panic(fmt.Errorf("load config: %w", err))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
-	defer cancel()
+	// The outer context represents the lifetime of this conversation/process.
+	// Per-loop timeouts are applied inside Agent.Run so a multi-step Agent is not
+	// forced to share one deadline across all model and tool calls.
+	ctx := context.Background()
+
+	if cfg.Diagnostics != nil {
+		pprofServer, err := startPprofServer(ctx, cfg.Diagnostics.PprofAddr)
+		if err != nil {
+			panic(fmt.Errorf("start pprof server: %w", err))
+		}
+		if pprofServer != nil {
+			fmt.Printf("pprof 已启动：http://%s/debug/pprof/\n", pprofServer.Addr())
+		}
+	}
 
 	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
 	registry := NewToolRegistry()
-	for _, tool := range []Tool{calculatorTool(), getProjectStatusTool()} {
+	for _, tool := range []Tool{calculatorTool(), expressionCalculatorTool(), getProjectStatusTool()} {
 		if err := registry.Register(tool); err != nil {
 			panic(fmt.Errorf("register tool: %w", err))
 		}
 	}
 
-	fmt.Print("请输入问题：")
-	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(input) == 0 {
-		panic(fmt.Errorf("read user input: %w", err))
+	var agent *Agent
+	if err := registry.Register(systemPromptTool(&agent)); err != nil {
+		panic(fmt.Errorf("register system prompt tool: %w", err))
 	}
-	input = strings.TrimSpace(input)
-	if input == "" {
-		panic("user input cannot be empty")
-	}
-
-	agent, err := NewAgent(client, cfg, registry)
+	agent, err = NewAgent(client, cfg, registry)
 	if err != nil {
 		panic(fmt.Errorf("create agent: %w", err))
 	}
-	answer, err := agent.Run(ctx, input)
-	if err != nil {
-		fmt.Printf("Agent 已安全停止：%s\n", err)
-		return
+
+	// One Agent instance owns one conversation. Keep reading turns until EOF
+	// or the user explicitly exits, so history is available to the next Run.
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("请输入问题（输入 exit 退出）：")
+	for {
+		fmt.Print("> ")
+		input, readErr := reader.ReadString('\n')
+		if readErr != nil && len(input) == 0 {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			fmt.Printf("读取输入失败：%s\n", readErr)
+			break
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			continue
+		}
+		if strings.EqualFold(input, "exit") || strings.EqualFold(input, "quit") {
+			break
+		}
+		if strings.HasPrefix(input, "/system ") {
+			instruction := strings.TrimSpace(strings.TrimPrefix(input, "/system "))
+			update := agent.SetSystemPrompt
+			if strings.HasPrefix(instruction, "add ") {
+				instruction = strings.TrimSpace(strings.TrimPrefix(instruction, "add "))
+				update = agent.AddSystemPrompt
+			}
+			if err := update(instruction); err != nil {
+				fmt.Printf("系统指令更新失败：%s\n", err)
+			} else {
+				fmt.Println("系统指令已更新，下一轮对话立即生效。")
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			continue
+		}
+		if input == "/system" {
+			fmt.Printf("当前系统指令：\n%s\n", agent.SystemPrompt())
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			continue
+		}
+
+		answer, runErr := agent.Run(ctx, input)
+		if runErr != nil {
+			fmt.Printf("Agent 已安全停止：%s\n", runErr)
+		} else {
+			fmt.Println(answer)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
-	fmt.Println(answer)
 }
 
 func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Config, req ModelRequest, step int, trace *Trace) (*ModelResponse, error) {
@@ -198,14 +259,18 @@ func calculatorTool() Tool {
 	return &functionTool{
 		definition: ToolDefinition{
 			Name:        toolName,
-			Description: "执行两个数字的加减乘除运算",
+			Description: "执行用户明确要求的两个数字的单步运算。必须严格按照用户表达式选择 operation：加号或加法使用 add，减号或减法使用 subtract，乘号或乘法使用 multiply，除号或除法使用 divide；不得自行改变用户要求的运算类型。",
 			Strict:      true,
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"a":         map[string]any{"type": "number"},
-					"b":         map[string]any{"type": "number"},
-					"operation": map[string]any{"type": "string", "enum": []string{"add", "subtract", "multiply", "divide"}},
+					"a": map[string]any{"type": "number"},
+					"b": map[string]any{"type": "number"},
+					"operation": map[string]any{
+						"type":        "string",
+						"enum":        []string{"add", "subtract", "multiply", "divide"},
+						"description": "严格匹配用户表达式：+ 或加法=add；- 或减法=subtract；* 或乘法=multiply；/ 或除法=divide。",
+					},
 				},
 				"required":             []string{"a", "b", "operation"},
 				"additionalProperties": false,

@@ -173,6 +173,91 @@ func TestAgentLoopStopsAtMaximumSteps(t *testing.T) {
 	}
 }
 
+func TestAgentLoopUsesFreshTimeoutForEachStep(t *testing.T) {
+	model := &perLoopDeadlineModel{}
+	registry := NewToolRegistry()
+	if err := registry.Register(calculatorTool()); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	cfg := &config.Config{
+		MaxSteps:       2,
+		MaxRetries:     0,
+		RequestTimeout: 50 * time.Millisecond,
+		Model:          &config.ModelConfig{Name: "fake", BaseURL: "fake://model"},
+		Tool:           &config.ToolConfig{MaxToolRecoveries: 1},
+	}
+	agent, err := NewAgent(model, cfg, registry)
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+
+	answer, err := agent.Run(context.Background(), "1 + 2 等于多少")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if answer != "done" {
+		t.Fatalf("answer = %q, want %q", answer, "done")
+	}
+	if len(model.Deadlines) != 2 {
+		t.Fatalf("deadline count = %d, want 2", len(model.Deadlines))
+	}
+	if !model.Deadlines[1].After(model.Deadlines[0]) {
+		t.Fatalf("second step did not receive a fresh timeout: first=%s second=%s", model.Deadlines[0], model.Deadlines[1])
+	}
+}
+
+func TestAgentSupportsContinuousConversation(t *testing.T) {
+	client := NewFakeModelClient(
+		NewFakeTextResult("第一轮回答"),
+		NewFakeTextResult("第二轮回答"),
+	)
+	agent := newTestAgent(t, client, 3, 0)
+
+	answer, err := agent.Run(context.Background(), "我叫 Crane")
+	if err != nil || answer != "第一轮回答" {
+		t.Fatalf("first Run() answer=%q, error=%v", answer, err)
+	}
+	answer, err = agent.Run(context.Background(), "我叫什么？")
+	if err != nil || answer != "第二轮回答" {
+		t.Fatalf("second Run() answer=%q, error=%v", answer, err)
+	}
+
+	if len(client.ReceivedRequests) != 2 {
+		t.Fatalf("request count = %d, want 2", len(client.ReceivedRequests))
+	}
+	messages := client.ReceivedRequests[1].Messages
+	if len(messages) != 3 {
+		t.Fatalf("second request messages = %d, want 3", len(messages))
+	}
+	if messages[0].Role != "user" || messages[0].Content != "我叫 Crane" {
+		t.Fatalf("first history message = %+v", messages[0])
+	}
+	if messages[1].Role != "assistant" || messages[1].Content != "第一轮回答" {
+		t.Fatalf("assistant history message = %+v", messages[1])
+	}
+	if messages[2].Role != "user" || messages[2].Content != "我叫什么？" {
+		t.Fatalf("second user message = %+v", messages[2])
+	}
+}
+
+type perLoopDeadlineModel struct {
+	Deadlines []time.Time
+}
+
+func (m *perLoopDeadlineModel) Complete(ctx context.Context, _ ModelRequest) (*ModelResponse, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("model context has no per-loop deadline")
+	}
+	m.Deadlines = append(m.Deadlines, deadline)
+	if len(m.Deadlines) == 1 {
+		return &ModelResponse{ToolCalls: []ToolCall{{
+			ID: "call_1", Name: toolName, Arguments: `{"a":1,"b":2,"operation":"add"}`,
+		}}}, nil
+	}
+	return &ModelResponse{Content: "done"}, nil
+}
+
 func newTestAgent(t *testing.T, client *FakeModelClient, maxSteps, maxRetries int) *Agent {
 	t.Helper()
 	cfg := &config.Config{

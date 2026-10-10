@@ -13,15 +13,16 @@ type Trace struct {
 }
 
 type traceEvent struct {
-	Step       int    `json:"step"`
-	Event      string `json:"event"`
-	Attempt    int    `json:"attempt,omitempty"`
-	Tool       string `json:"tool,omitempty"`
-	Arguments  string `json:"arguments,omitempty"`
-	Result     string `json:"result,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	DurationMS int64  `json:"durationMs,omitempty"`
+	Step         int           `json:"step"`
+	Event        string        `json:"event"`
+	Attempt      int           `json:"attempt,omitempty"`
+	Tool         string        `json:"tool,omitempty"`
+	Arguments    string        `json:"arguments,omitempty"`
+	Result       string        `json:"result,omitempty"`
+	Error        string        `json:"error,omitempty"`
+	Reason       string        `json:"reason,omitempty"`
+	DurationMS   int64         `json:"durationMs,omitempty"`
+	ContextStats *ContextStats `json:"contextStats,omitempty"`
 }
 
 func (t *Trace) Add(event traceEvent) {
