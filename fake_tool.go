@@ -18,6 +18,7 @@ type FakeToolCall struct {
 type FakeToolExecutor struct {
 	ToolName   string
 	ToolSchema ToolDefinition
+	Spec       ToolSpec
 	Result     ToolResult
 	Err        error
 
@@ -48,6 +49,17 @@ func (f *FakeToolExecutor) Definition() ToolDefinition {
 		f.ToolSchema.Name = f.ToolName
 	}
 	return f.ToolSchema
+}
+
+func (f *FakeToolExecutor) ToolSpec() ToolSpec {
+	spec := f.Spec
+	if spec.Name == "" {
+		spec.Name = f.ToolName
+	}
+	if spec.Definition.Name == "" {
+		spec.Definition = f.Definition()
+	}
+	return spec
 }
 
 func (f *FakeToolExecutor) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {

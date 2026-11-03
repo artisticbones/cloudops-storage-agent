@@ -141,8 +141,64 @@ func TestAgentLoopTimeoutSafelyExits(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context deadline exceeded", err)
 	}
-	if !client.ContextCancelled {
-		t.Fatal("FakeModelClient should observe the cancelled context")
+	if client.CallCount != 0 {
+		t.Fatalf("model call count = %d, want no model call after parent cancellation", client.CallCount)
+	}
+}
+
+func TestAgentRetrieverReceivesCanceledParentContext(t *testing.T) {
+	retriever := &cancellationRetriever{started: make(chan struct{})}
+	cfg := &config.Config{
+		MaxSteps: 1, MaxRetries: 0, RequestTimeout: time.Second,
+		Model: &config.ModelConfig{Name: "fake", BaseURL: "fake://model"},
+		Tool:  &config.ToolConfig{},
+	}
+	agent, err := NewAgentWithRetriever(NewFakeModelClient(NewFakeTextResult("done")), cfg, NewToolRegistry(), retriever, "tenant-a", "v1")
+	if err != nil {
+		t.Fatalf("NewAgentWithRetriever() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, runErr := agent.Run(ctx, "query")
+		result <- runErr
+	}()
+	<-retriever.started
+	cancel()
+	err = <-result
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+type cancellationRetriever struct {
+	started chan struct{}
+}
+
+func (r *cancellationRetriever) Search(ctx context.Context, _, _, _ string, _ int) ([]Document, error) {
+	close(r.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestNewAgentWithRetrieverRejectsEmptyScope(t *testing.T) {
+	cfg := &config.Config{
+		MaxSteps: 1, RequestTimeout: time.Second,
+		Model: &config.ModelConfig{Name: "fake", BaseURL: "fake://model"},
+		Tool:  &config.ToolConfig{},
+	}
+	for name, scope := range map[string][2]string{
+		"empty tenant":  [2]string{"", "v1"},
+		"empty version": [2]string{"tenant-a", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tenant, version := scope[0], scope[1]
+			_, err := NewAgentWithRetriever(NewFakeModelClient(NewFakeTextResult("done")), cfg, NewToolRegistry(), &fakeRetriever{}, tenant, version)
+			var agentErr *AgentError
+			if !errors.As(err, &agentErr) || agentErr.Kind != InvalidArgument {
+				t.Fatalf("constructor error = %v, want invalid argument", err)
+			}
+		})
 	}
 }
 
@@ -237,6 +293,31 @@ func TestAgentSupportsContinuousConversation(t *testing.T) {
 	}
 	if messages[2].Role != "user" || messages[2].Content != "我叫什么？" {
 		t.Fatalf("second user message = %+v", messages[2])
+	}
+}
+
+func TestAgentUsesInjectedModelRouter(t *testing.T) {
+	primary := NewFakeModelClient(NewFakeTextResult("routed answer"))
+	router := NewModelRouter(ModelRouterOptions{
+		Primary: ModelEndpoint{Name: "routed", Client: primary, Capability: ModelCapability{Name: "routed"}},
+	})
+	cfg := &config.Config{
+		MaxSteps:       1,
+		MaxRetries:     0,
+		RequestTimeout: time.Second,
+		Model:          &config.ModelConfig{Name: "legacy", BaseURL: "fake://legacy"},
+		Tool:           &config.ToolConfig{},
+	}
+	agent, err := NewAgentWithRouter(router, cfg, NewToolRegistry())
+	if err != nil {
+		t.Fatalf("NewAgentWithRouter() error = %v", err)
+	}
+	answer, err := agent.Run(context.Background(), "hello")
+	if err != nil || answer != "routed answer" {
+		t.Fatalf("Run() answer=%q error=%v", answer, err)
+	}
+	if primary.CallCount != 1 {
+		t.Fatalf("primary calls = %d, want 1", primary.CallCount)
 	}
 }
 

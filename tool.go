@@ -22,11 +22,23 @@ type ToolResult struct {
 
 type functionTool struct {
 	definition ToolDefinition
+	spec       ToolSpec
 	handler    func(context.Context, string) (string, error)
 }
 
 func (t *functionTool) Definition() ToolDefinition {
 	return t.definition
+}
+
+func (t *functionTool) ToolSpec() ToolSpec {
+	spec := t.spec
+	if spec.Name == "" {
+		spec.Name = t.definition.Name
+	}
+	if spec.Definition.Name == "" {
+		spec.Definition = t.definition
+	}
+	return spec
 }
 
 func (t *functionTool) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {

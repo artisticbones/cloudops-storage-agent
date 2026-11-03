@@ -12,12 +12,17 @@ import (
 type FakeModelResult struct {
 	Response *ModelResponse
 	Err      error
+	// BlockUntilContext makes this result represent an in-flight network call.
+	BlockUntilContext bool
 }
 
 // FakeModelClient 是 ModelClient 的内存实现，用于测试 Agent Runtime。
 // 它不会访问真实模型，只按 Responses 的顺序返回结果。
 type FakeModelClient struct {
 	Responses []FakeModelResult
+	// ResponseFunc can derive a response from the actual model-facing request.
+	// It is useful for proving that a fake model only cites retrieved context.
+	ResponseFunc func(ModelRequest) (*ModelResponse, error)
 
 	// ReceivedRequests 保存每次收到的请求，顺序与 Complete 调用顺序一致。
 	ReceivedRequests []ModelRequest
@@ -65,6 +70,7 @@ func (f *FakeModelClient) Complete(ctx context.Context, request ModelRequest) (*
 	f.CallCount++
 	f.ReceivedRequests = append(f.ReceivedRequests, cloneModelRequest(request))
 	callIndex := f.CallCount - 1
+	callCount := f.CallCount
 	f.mu.Unlock()
 
 	if ctx != nil {
@@ -79,11 +85,29 @@ func (f *FakeModelClient) Complete(ctx context.Context, request ModelRequest) (*
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if callIndex >= len(f.Responses) {
-		return nil, fmt.Errorf("fake model has no response for call %d", f.CallCount)
+	responseFunc := f.ResponseFunc
+	var result FakeModelResult
+	if callIndex < len(f.Responses) {
+		result = f.Responses[callIndex]
+		responseFunc = nil
+	} else if responseFunc == nil {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("fake model has no response for call %d", callCount)
 	}
-	result := f.Responses[callIndex]
+	f.mu.Unlock()
+	if responseFunc != nil {
+		return responseFunc(cloneModelRequest(request))
+	}
+	if result.BlockUntilContext {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		<-ctx.Done()
+		f.mu.Lock()
+		f.ContextCancelled = true
+		f.mu.Unlock()
+		return nil, ctx.Err()
+	}
 	if result.Err != nil {
 		return nil, result.Err
 	}

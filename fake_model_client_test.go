@@ -89,6 +89,34 @@ func TestFakeModelClientChecksCancelledContext(t *testing.T) {
 	}
 }
 
+func TestFakeModelClientBlocksUntilContextCancellation(t *testing.T) {
+	client := NewFakeModelClient(FakeModelResult{BlockUntilContext: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Complete(ctx, ModelRequest{})
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("Complete returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Complete did not observe context cancellation")
+	}
+	if !client.ContextCancelled {
+		t.Fatal("FakeModelClient should record in-flight cancellation")
+	}
+}
+
 func TestAgentUsesInjectedFakeModelClient(t *testing.T) {
 	client := NewFakeModelClient(
 		NewFakeCalculatorToolCallResult("call_1", `{"a":123,"b":45,"operation":"add"}`),

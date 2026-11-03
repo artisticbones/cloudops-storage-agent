@@ -23,8 +23,14 @@ func TestLoadConfigUsesDefaults(t *testing.T) {
 	if cfg.RequestTimeout != defaultRequestTimeout {
 		t.Fatalf("RequestTimeout = %s, want %s", cfg.RequestTimeout, defaultRequestTimeout)
 	}
+	if cfg.ContextTokenBudget != DefaultContextTokenBudget {
+		t.Fatalf("ContextTokenBudget = %d, want %d", cfg.ContextTokenBudget, DefaultContextTokenBudget)
+	}
 	if cfg.Model.Name != defaultModel || cfg.Model.BaseURL != defaultBaseURL {
 		t.Fatalf("unexpected model defaults: %+v", cfg.Model)
+	}
+	if cfg.Model.APIKey != "" {
+		t.Fatalf("default API key = %q, want empty", cfg.Model.APIKey)
 	}
 	if cfg.Tool.MaxToolRecoveries != defaultMaxToolRecoveries {
 		t.Fatalf("MaxToolRecoveries = %d, want %d", cfg.Tool.MaxToolRecoveries, defaultMaxToolRecoveries)
@@ -45,6 +51,7 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("AGENT_MAX_STEPS", "8")
 	t.Setenv("AGENT_MAX_RETRIES", "3")
 	t.Setenv("AGENT_REQUEST_TIMEOUT", "45s")
+	t.Setenv("AGENT_CONTEXT_TOKEN_BUDGET", "2048")
 	t.Setenv("AGENT_MAX_TOOL_RECOVERIES", "4")
 	t.Setenv("AGENT_PPROF_ADDR", "127.0.0.1:6060")
 	t.Setenv("AGENT_SYSTEM_PROMPT_FILE", "test-system.md")
@@ -57,7 +64,7 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	if cfg.Model.APIKey != "test-key" || cfg.Model.Name != "test-model" || cfg.Model.BaseURL != "http://example.com/v1/" {
 		t.Fatalf("unexpected model config: %+v", cfg.Model)
 	}
-	if cfg.MaxSteps != 8 || cfg.MaxRetries != 3 || cfg.RequestTimeout != 45*time.Second || cfg.Tool.MaxToolRecoveries != 4 {
+	if cfg.MaxSteps != 8 || cfg.MaxRetries != 3 || cfg.RequestTimeout != 45*time.Second || cfg.ContextTokenBudget != 2048 || cfg.Tool.MaxToolRecoveries != 4 {
 		t.Fatalf("unexpected runtime config: %+v", cfg)
 	}
 	if cfg.Diagnostics.PprofAddr != "127.0.0.1:6060" {
@@ -92,6 +99,8 @@ func TestConfigValidate(t *testing.T) {
 		{name: "negative retries", cfg: validConfig(func(c *Config) { c.MaxRetries = -1 })},
 		{name: "zero timeout", cfg: validConfig(func(c *Config) { c.RequestTimeout = 0 })},
 		{name: "negative recoveries", cfg: validConfig(func(c *Config) { c.Tool.MaxToolRecoveries = -1 })},
+		{name: "negative routing retries", cfg: validConfig(func(c *Config) { c.Routing = &RoutingConfig{MaxRetries: -1} })},
+		{name: "invalid fallback endpoint", cfg: validConfig(func(c *Config) { c.Routing = &RoutingConfig{Fallback: &ModelConfig{}} })},
 	}
 
 	for _, tt := range tests {
@@ -100,6 +109,20 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatal("Validate() error = nil, want error")
 			}
 		})
+	}
+}
+
+func TestConfigAcceptsInjectedRoutingEndpoints(t *testing.T) {
+	cfg := validConfig(func(c *Config) {
+		c.Routing = &RoutingConfig{
+			Fallback:   &ModelConfig{Name: "backup", BaseURL: "http://backup/v1"},
+			Ollama:     &ModelConfig{Name: "local", BaseURL: "http://localhost:11434/v1", Local: true},
+			MaxRetries: 2,
+			MaxCalls:   4,
+		}
+	})
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 
@@ -127,6 +150,7 @@ func clearConfigEnv(t *testing.T) {
 		"AGENT_MAX_STEPS",
 		"AGENT_MAX_RETRIES",
 		"AGENT_REQUEST_TIMEOUT",
+		"AGENT_CONTEXT_TOKEN_BUDGET",
 		"AGENT_MAX_TOOL_RECOVERIES",
 		"AGENT_PPROF_ADDR",
 		"AGENT_SYSTEM_PROMPT_FILE",

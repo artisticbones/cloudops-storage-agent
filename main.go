@@ -73,7 +73,6 @@ func main() {
 		}
 	}
 
-	client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
 	registry := NewToolRegistry()
 	for _, tool := range []Tool{calculatorTool(), expressionCalculatorTool(), getProjectStatusTool()} {
 		if err := registry.Register(tool); err != nil {
@@ -85,7 +84,12 @@ func main() {
 	if err := registry.Register(systemPromptTool(&agent)); err != nil {
 		panic(fmt.Errorf("register system prompt tool: %w", err))
 	}
-	agent, err = NewAgent(client, cfg, registry)
+	if router := buildModelRouter(cfg); router != nil {
+		agent, err = NewAgentWithRouter(router, cfg, registry)
+	} else {
+		client := NewOpenAICompatibleModelClient(newClient(cfg), cfg.Model.Name)
+		agent, err = NewAgent(client, cfg, registry)
+	}
 	if err != nil {
 		panic(fmt.Errorf("create agent: %w", err))
 	}
@@ -160,7 +164,7 @@ func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Conf
 		}
 
 		lastErr = err
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || attempt > cfg.MaxRetries {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) || attempt > cfg.MaxRetries {
 			break
 		}
 		classified := classifyRuntimeError(ctx, err)
@@ -169,11 +173,29 @@ func requestCompletion(ctx context.Context, client ModelClient, cfg *config.Conf
 	return nil, classifyRuntimeError(ctx, lastErr)
 }
 
+func requestCompletionWithRouter(ctx context.Context, router ModelRouter, req ModelRequest) (*ModelResponse, error) {
+	client, _, err := router.Select(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return client.Complete(ctx, req)
+}
+
 func classifyRuntimeError(ctx context.Context, err error) *AgentError {
+	var agentErr *AgentError
+	if errors.As(err, &agentErr) {
+		return agentErr
+	}
+	if err == nil {
+		return &AgentError{Kind: ModelError, Message: "model request failed"}
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return &AgentError{Kind: TimeoutError, Message: "agent context deadline exceeded", Err: ctx.Err()}
 	}
-	return &AgentError{Kind: NetworkError, Message: err.Error(), Err: err}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return &AgentError{Kind: TimeoutError, Message: "agent context canceled", Err: ctx.Err()}
+	}
+	return classifyModelError(ctx, err)
 }
 
 func classifyToolError(err error) *AgentError {
@@ -225,10 +247,54 @@ func exceededRecoveryLimit(recoveryCount, maxRecoveries int) bool {
 }
 
 func newClient(cfg *config.Config) openai.Client {
-	return openai.NewClient(
-		option.WithAPIKey(cfg.Model.APIKey),
-		option.WithBaseURL(cfg.Model.BaseURL),
-	)
+	return newClientForModel(cfg.Model)
+}
+
+func newClientForModel(model *config.ModelConfig) openai.Client {
+	options := []option.RequestOption{option.WithBaseURL(model.BaseURL)}
+	if strings.TrimSpace(model.APIKey) != "" {
+		options = append(options, option.WithAPIKey(model.APIKey))
+	}
+	return openai.NewClient(options...)
+}
+
+func buildModelRouter(cfg *config.Config) ModelRouter {
+	if cfg == nil || cfg.Routing == nil {
+		return nil
+	}
+	routing := cfg.Routing
+	return NewModelRouter(ModelRouterOptions{
+		Primary:      modelEndpoint(routing.Primary),
+		Fallback:     modelEndpoint(routing.Fallback),
+		Ollama:       modelEndpoint(routing.Ollama),
+		MaxRetries:   routing.MaxRetries,
+		RetryBackoff: routing.RetryBackoff,
+		RetryMaxTime: routing.RetryMaxTime,
+		Budget: ModelBudget{
+			MaxInputTokens:  routing.MaxInputTokens,
+			MaxOutputTokens: routing.MaxOutputTokens,
+			MaxCalls:        routing.MaxCalls,
+			MaxCost:         routing.MaxCost,
+			MaxDuration:     routing.MaxDuration,
+		},
+	})
+}
+
+func modelEndpoint(model *config.ModelConfig) ModelEndpoint {
+	if model == nil {
+		return ModelEndpoint{}
+	}
+	return ModelEndpoint{
+		Name:   model.Name,
+		Client: NewOpenAICompatibleModelClient(newClientForModel(model), model.Name),
+		Capability: ModelCapability{
+			Name:               model.Name,
+			Provider:           "openai-compatible",
+			Local:              model.Local,
+			InputCostPerToken:  model.InputCostPerToken,
+			OutputCostPerToken: model.OutputCostPerToken,
+		},
+	}
 }
 
 func handleToolError(ctx context.Context, err error) (action string) {
@@ -314,7 +380,7 @@ func dispatchTool(ctx context.Context, registry ToolRegistry, name, rawArgs stri
 
 	result, err := tool.Execute(ctx, json.RawMessage(rawArgs))
 	if err != nil {
-		return "", err
+		return "", sanitizeToolError(err, toolSpecFor(tool), json.RawMessage(rawArgs))
 	}
 	return result.Content, nil
 }
